@@ -1203,9 +1203,6 @@ async def tiktok_parser(account_name, adspower_id, project_name, keyword, target
             await reset_page.close()
 
             page = await context.new_page()
-            checker_page = None
-            if not export_only:
-                checker_page = await context.new_page()
 
             intercepted_data = {}
 
@@ -1523,85 +1520,125 @@ async def tiktok_parser(account_name, adspower_id, project_name, keyword, target
                                 except:
                                     pass
                     else:
-                        await checker_page.bring_to_front()
+                        # "В работу" — тот же алгоритм глубокой проверки что и в .txt
+                        kw_lower = keyword.lower().replace("#", "").strip() if not is_foryou else ""
+                        kw_words = [w for w in kw_lower.split() if len(w) > 2] if kw_lower else []
 
                         for video_url, card_text in new_raw_links:
                             if len(collected_urls) >= target_count:
                                 break
-                            is_too_old = False
-                            if max_age_seconds > 0 and card_text:
-                                from datetime import timedelta
-                                card_ts = None
-                                match = re.search(r'\b(20\d{2})-(\d{1,2})-(\d{1,2})\b', card_text)
-                                if match:
-                                    year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
-                                    try:
-                                        card_ts = int(datetime(year, month, day).timestamp())
-                                    except:
-                                        pass
-                                else:
-                                    match = re.search(r'(?m)^(\d{1,2})-(\d{1,2})$', card_text)
-                                    if match:
-                                        month, day = int(match.group(1)), int(match.group(2))
-                                        year = datetime.now().year
-                                        try:
-                                            card_ts = int(datetime(year, month, day).timestamp())
-                                        except:
-                                            pass
-                                    else:
-                                        match = re.search(r'\b(\d+)([mhdwy])( ago)?\b', card_text)
-                                        if match:
-                                            val = int(match.group(1))
-                                            unit = match.group(2)
-                                            from datetime import timedelta
-                                            delta = timedelta(0)
-                                            if unit == 'm': delta = timedelta(minutes=val)
-                                            elif unit == 'h': delta = timedelta(hours=val)
-                                            elif unit == 'd': delta = timedelta(days=val)
-                                            elif unit == 'w': delta = timedelta(weeks=val)
-                                            elif unit == 'y': delta = timedelta(days=val * 365)
-                                            card_ts = int((datetime.now() - delta).timestamp())
-                                if card_ts:
-                                    age_sec = current_ts - card_ts
-                                    if age_sec > max_age_seconds:
-                                        is_too_old = True
-                            if is_too_old:
-                                continue
 
-                            logging.info(f"[{account_name}] 🕵️‍♂️ Заходим в видео: {video_url}")
+                            active_statuses[f"Парсер_{account_name}"] = f"Проверяю видео {len(collected_urls)+1}/{target_count}..."
+                            logging.info(f"[{account_name}] 🖱️ Кликаю на видео: {video_url}")
+
                             try:
-                                await checker_page.goto(video_url, wait_until="domcontentloaded", timeout=30000)
-                                await checker_page.wait_for_timeout(random.randint(3000, 4000))
-                                stats = await checker_page.evaluate(r'''() => {
-                                    let v = 0; let c = 0;
+                                await page.goto(video_url, wait_until="domcontentloaded", timeout=25000)
+                                await page.wait_for_timeout(2500)
+
+                                video_data = await page.evaluate(r'''() => {
+                                    let views = 0, createTime = 0, fullText = "";
                                     try {
-                                        let scripts = document.querySelectorAll('script[id="__UNIVERSAL_DATA_FOR_REHYDRATION__"], script[id="SIGI_STATE"]');
-                                        for (let script of scripts) {
-                                            let text = script.textContent;
-                                            let matchV = text.match(/"playCount":(\d+)/);
-                                            if (matchV) v = parseInt(matchV[1]);
-                                            let matchC = text.match(/"createTime":"?(\d+)"?/);
-                                            if (matchC) c = parseInt(matchC[1]);
-                                            if (v > 0) break;
+                                        const scripts = document.querySelectorAll(
+                                            'script[id="__UNIVERSAL_DATA_FOR_REHYDRATION__"], script[id="SIGI_STATE"]'
+                                        );
+                                        for (let sc of scripts) {
+                                            const t = sc.textContent || "";
+                                            const mv = t.match(/"playCount"\s*:\s*(\d+)/);
+                                            if (mv) views = parseInt(mv[1]);
+                                            const mc = t.match(/"createTime"\s*:\s*"?(\d+)"?/);
+                                            if (mc) createTime = parseInt(mc[1]);
+                                            const md = t.match(/"desc"\s*:\s*"([^"]{0,800})"/);
+                                            if (md) fullText += " " + md[1];
+                                            const tagMatches = [...t.matchAll(/"hashtagName"\s*:\s*"([^"]+)"/g)];
+                                            for (const m of tagMatches) fullText += " " + m[1];
+                                            if (views > 0) break;
+                                        }
+                                        const descSelectors = [
+                                            '[data-e2e="browse-video-desc"]',
+                                            '[data-e2e="video-desc"]',
+                                            '[class*="SpanDesc"]',
+                                            '[class*="video-meta-title"]',
+                                            'h1[class*="title"]',
+                                        ];
+                                        for (const sel of descSelectors) {
+                                            const el = document.querySelector(sel);
+                                            if (el) { fullText += " " + (el.innerText || el.textContent || ""); break; }
+                                        }
+                                        document.querySelectorAll('a[href*="/tag/"], a[data-e2e*="hashtag"]').forEach(a => {
+                                            fullText += " " + (a.innerText || a.textContent || "");
+                                        });
+                                        if (views === 0) {
+                                            const viewSelectors = [
+                                                '[data-e2e="like-icon"] + strong',
+                                                '[data-e2e="video-views"]',
+                                                '[class*="StrongVideoPlayCount"]',
+                                            ];
+                                            for (const sel of viewSelectors) {
+                                                const el = document.querySelector(sel);
+                                                if (el) {
+                                                    const txt = (el.innerText || "").replace(/[,. ]/g, "").toUpperCase();
+                                                    if (txt.includes("M")) views = parseFloat(txt) * 1000000;
+                                                    else if (txt.includes("K")) views = parseFloat(txt) * 1000;
+                                                    else views = parseInt(txt) || 0;
+                                                    break;
+                                                }
+                                            }
                                         }
                                     } catch(e) {}
-                                    return {views: v, createTime: c};
+                                    return { views, createTime, fullText: fullText.toLowerCase() };
                                 }''')
-                                views_count = stats.get("views", 0)
-                                create_time = stats.get("createTime", 0)
-                                is_too_old = False
+
+                                views_count = video_data.get("views", 0)
+                                create_time = video_data.get("createTime", 0)
+                                full_text = video_data.get("fullText", "")
+
+                                logging.info(f"[{account_name}] 📊 Видео: {views_count} просм. | текст: '{full_text[:80]}'")
+
                                 if max_age_seconds > 0 and create_time > 0:
-                                    age_seconds = current_ts - create_time
-                                    if age_seconds > max_age_seconds:
-                                        is_too_old = True
-                                if not is_too_old and views_count >= min_views:
-                                    collected_urls.add(video_url)
-                                    logging.info(f"[{account_name}] ✅ Подходит: {views_count} просм. — {video_url}")
-                                else:
-                                    logging.info(f"[{account_name}] ⏩ Отбраковка: {views_count} просм.")
-                            except Exception as e:
-                                logging.debug(f"Ошибка загрузки страницы видео: {e}")
-                            await checker_page.wait_for_timeout(random.randint(2000, 3000))
+                                    if (current_ts - create_time) > max_age_seconds:
+                                        logging.info(f"[{account_name}] ⏩ Слишком старое видео, пропускаю")
+                                        await page.go_back(wait_until="domcontentloaded", timeout=15000)
+                                        await page.wait_for_timeout(1000)
+                                        continue
+
+                                if views_count < min_views:
+                                    logging.info(f"[{account_name}] ⏩ Мало просмотров: {views_count} < {min_views}")
+                                    await page.go_back(wait_until="domcontentloaded", timeout=15000)
+                                    await page.wait_for_timeout(1000)
+                                    continue
+
+                                is_relevant = True
+                                if kw_lower and not is_foryou:
+                                    if is_hashtag:
+                                        is_relevant = kw_lower in full_text
+                                    else:
+                                        if kw_words:
+                                            is_relevant = any(w in full_text for w in kw_words)
+                                        else:
+                                            is_relevant = kw_lower in full_text
+
+                                if not is_relevant:
+                                    logging.info(f"[{account_name}] ⏩ Не по теме '{kw_lower}': {video_url}")
+                                    await page.go_back(wait_until="domcontentloaded", timeout=15000)
+                                    await page.wait_for_timeout(1000)
+                                    continue
+
+                                clean_video_url = video_url.split('?')[0].split('#')[0]
+                                collected_urls.add(clean_video_url)
+                                logging.info(f"[{account_name}] ✅ ДОБАВЛЕНО ({views_count} просм.) [{len(collected_urls)}/{target_count}]: {clean_video_url}")
+                                active_statuses[f"Парсер_{account_name}"] = f"✅ Собрано {len(collected_urls)}/{target_count} — '{keyword}'"
+
+                                await page.go_back(wait_until="domcontentloaded", timeout=15000)
+                                await page.wait_for_timeout(1200)
+
+                            except Exception as e_check:
+                                logging.warning(f"[{account_name}] ⚠️ Ошибка проверки {video_url}: {e_check}")
+                                try:
+                                    if search_url not in page.url:
+                                        await page.goto(search_url, wait_until="domcontentloaded", timeout=25000)
+                                        await page.wait_for_timeout(2000)
+                                except:
+                                    pass
 
                 logging.info(f"[{account_name}] 📊 Итого собрано: {len(collected_urls)}/{target_count}")
                 active_statuses[f"Парсер_{account_name}"] = f"Парсинг '{keyword}': собрано {len(collected_urls)}/{target_count}, попытка {attempts}"
@@ -1674,8 +1711,6 @@ async def tiktok_parser(account_name, adspower_id, project_name, keyword, target
     finally:
         active_statuses.pop(f"Парсер_{account_name}", None)
         try:
-            if checker_page is not None and not checker_page.is_closed():
-                await checker_page.close()
             if 'page' in locals() and not page.is_closed():
                 await page.close()
             if 'context' in locals():
