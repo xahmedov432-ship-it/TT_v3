@@ -318,6 +318,44 @@ async def send_error_to_tg(error_msg: str, account_name: str = "SYSTEM"):
 
 
 # ================= ОЖИДАНИЕ ЗАГРУЗКИ СТРАНИЦ =================
+async def is_captcha_page(page, account_name) -> bool:
+    """Проверяет, показана ли на странице капча или верификация TikTok."""
+    try:
+        captcha_signals = await page.evaluate(r'''() => {
+            const bodyText = (document.body?.innerText || document.body?.textContent || "").toLowerCase();
+            const captchaKeywords = [
+                "verify", "verification", "captcha", "robot", "human",
+                "проверка", "верификация", "подтвердите", "я не робот",
+                "tiktok_verify", "are you a human", "security check",
+                "slide to verify", "puzzlecaptcha", "verifypage"
+            ];
+            const hasCaptchaText = captchaKeywords.some(kw => bodyText.includes(kw));
+            const captchaSelectors = [
+                '#captcha-verify-image',
+                'div[class*="captcha"]',
+                'div[class*="verify"]',
+                'canvas[id*="captcha"]',
+                'div[id*="captcha"]',
+                '.captcha_verify_bar',
+                '.secsdk-captcha-drag-icon',
+                'div[class*="VerifyPage"]',
+                'div[class*="Captcha"]',
+                'iframe[src*="captcha"]',
+                'iframe[src*="verify"]',
+            ];
+            const hasCaptchaEl = captchaSelectors.some(sel => !!document.querySelector(sel));
+            const title = document.title.toLowerCase();
+            const hasCaptchaTitle = title.includes("verify") || title.includes("captcha") || title.includes("проверка");
+            return hasCaptchaText || hasCaptchaEl || hasCaptchaTitle;
+        }''')
+        if captcha_signals:
+            logging.warning(f"[{account_name}] 🛡️ Обнаружена капча / верификация!")
+        return bool(captcha_signals)
+    except Exception as e:
+        logging.debug(f"[{account_name}] Ошибка проверки капчи: {e}")
+        return False
+
+
 async def wait_for_search_page_ready(page, account_name, timeout_seconds=60):
     logging.info(f"[{account_name}] ⏳ Ждём загрузки ленты с видео (до {timeout_seconds}с)...")
     start = asyncio.get_event_loop().time()
@@ -1250,12 +1288,26 @@ async def tiktok_parser(account_name, adspower_id, project_name, keyword, target
                     page_loaded = True
                     break
                 else:
-                    logging.warning(f"[{account_name}] 🔄 Лента пуста (Попытка {retry+1}/3). Обновляем страницу...")
-                    try:
-                        await page.reload(wait_until="domcontentloaded", timeout=30000)
-                    except:
-                        pass
-                    await page.wait_for_timeout(5000)
+                    # Проверяем капчу
+                    if await is_captcha_page(page, account_name):
+                        logging.warning(f"[{account_name}] 🔄 Капча! Ждём 10с и обновляем страницу (Попытка {retry+1}/3)...")
+                        active_statuses[f"Парсер_{account_name}"] = f"Капча! Обновляю страницу (попытка {retry+1}/3)..."
+                        await page.wait_for_timeout(10000)
+                        try:
+                            await page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
+                        except:
+                            try:
+                                await page.reload(wait_until="domcontentloaded", timeout=30000)
+                            except:
+                                pass
+                        await page.wait_for_timeout(7000)
+                    else:
+                        logging.warning(f"[{account_name}] 🔄 Лента пуста (Попытка {retry+1}/3). Обновляем страницу...")
+                        try:
+                            await page.reload(wait_until="domcontentloaded", timeout=30000)
+                        except:
+                            pass
+                        await page.wait_for_timeout(5000)
 
             if not page_loaded:
                 logging.error(f"[{account_name}] ❌ Страница так и не отдала видео.")
@@ -1556,6 +1608,36 @@ async def tiktok_parser(account_name, adspower_id, project_name, keyword, target
 
                 if len(collected_urls) == prev_size:
                     no_new_streak += 1
+                    # При 2 пустых итерациях подряд — проверяем капчу и обновляем страницу
+                    if no_new_streak % 2 == 0 and no_new_streak < 8:
+                        logging.info(f"[{account_name}] 🔎 Нет новых ссылок {no_new_streak} раз подряд — проверяем страницу...")
+                        if await is_captcha_page(page, account_name):
+                            logging.warning(f"[{account_name}] 🔄 Капча в процессе парсинга! Ждём 10с и обновляем...")
+                            active_statuses[f"Парсер_{account_name}"] = f"Капча! Обновляю страницу... (собрано {len(collected_urls)}/{target_count})"
+                            await page.wait_for_timeout(10000)
+                            try:
+                                await page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
+                            except:
+                                try:
+                                    await page.reload(wait_until="domcontentloaded", timeout=30000)
+                                except:
+                                    pass
+                            await page.wait_for_timeout(7000)
+                            # Ждём пока страница нормально загрузится
+                            page_ok = await wait_for_search_page_ready(page, account_name, timeout_seconds=40)
+                            if not page_ok:
+                                # Ещё одна попытка
+                                await page.reload(wait_until="domcontentloaded", timeout=30000)
+                                await page.wait_for_timeout(7000)
+                                await wait_for_search_page_ready(page, account_name, timeout_seconds=30)
+                        else:
+                            # Страница просто не прогрузила новый контент — обычный reload
+                            logging.info(f"[{account_name}] 🔄 Нет капчи, обновляем страницу для подгрузки контента...")
+                            try:
+                                await page.reload(wait_until="domcontentloaded", timeout=30000)
+                            except:
+                                pass
+                            await page.wait_for_timeout(5000)
                     if no_new_streak >= 8:
                         logging.warning(f"[{account_name}] 🛑 Стрик 8 — контент кончился.")
                         break
