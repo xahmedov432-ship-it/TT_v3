@@ -29,6 +29,7 @@ ADMIN_ID = ADMIN_IDS[0]
 # ================= ГЛОБАЛЬНЫЕ СТАТУСЫ =================
 active_statuses = {}
 is_shadow_checking = False
+busy_accounts: set = set()  # аккаунты, занятые прямо сейчас (worker или parser)
 
 async def send_to_all_admins(text: str, parse_mode: str = "Markdown", reply_markup=None):
     for admin_id in ADMIN_IDS:
@@ -470,6 +471,10 @@ async def scroll_comments_panel(page, account_name, pixels=400):
 # ================= ОСНОВНОЙ ВОРКЕР =================
 async def tiktot_worker(account_name, adspower_id, project_name, video_url, template_text, reply_to_text=None, reply_to_comment_id=None, skip_like=False, reply_to_author_nickname=None):
     logging.info(f"[{account_name}] Попытка запуска профиля: {adspower_id}")
+    if account_name in busy_accounts:
+        logging.warning(f"[{account_name}] ⚠️ Аккаунт уже занят другой задачей, пропускаем.")
+        return False
+    busy_accounts.add(account_name)
     active_statuses[account_name] = f"Запуск профиля AdsPower в проекте '{project_name}'..."
 
     api_key = await get_api_key()
@@ -480,11 +485,13 @@ async def tiktot_worker(account_name, adspower_id, project_name, video_url, temp
         if resp.get("code") != 0:
             await send_error_to_tg(f"AdsPower ошибка: {resp.get('msg')}", account_name)
             active_statuses.pop(account_name, None)
+            busy_accounts.discard(account_name)
             return False
         ws_endpoint = resp["data"]["ws"]["puppeteer"]
     except Exception as e:
         await send_error_to_tg(f"Ошибка API: {e}", account_name)
         active_statuses.pop(account_name, None)
+        busy_accounts.discard(account_name)
         return False
 
     try:
@@ -1106,6 +1113,7 @@ async def tiktot_worker(account_name, adspower_id, project_name, video_url, temp
         return False
     finally:
         active_statuses.pop(account_name, None)
+        busy_accounts.discard(account_name)
         try:
             if 'page' in locals() and not page.is_closed():
                 await page.close()
@@ -1128,6 +1136,14 @@ async def tiktot_worker(account_name, adspower_id, project_name, video_url, temp
 # ================= АВТО-ПАРСЕР TIKTOK =================
 async def tiktok_parser(account_name, adspower_id, project_name, keyword, target_count, min_views, age_filter, message: Message, export_only: bool = False):
     logging.info(f"[{account_name}] Парсинг: {keyword} | Мин. просмотров: {min_views}")
+    if account_name in busy_accounts:
+        logging.warning(f"[{account_name}] ⚠️ Аккаунт уже занят, парсинг отложен.")
+        try:
+            await message.answer(f"⚠️ Аккаунт `{account_name}` сейчас занят другой задачей. Попробуйте позже.")
+        except:
+            pass
+        return
+    busy_accounts.add(account_name)
     active_statuses[f"Парсер_{account_name}"] = f"Запуск парсера для ключевого слова '{keyword}'..."
 
     current_ts = int(datetime.now().timestamp())
@@ -1591,6 +1607,7 @@ async def tiktok_parser(account_name, adspower_id, project_name, keyword, target
         logging.error(f"Ошибка парсера: {e}")
     finally:
         active_statuses.pop(f"Парсер_{account_name}", None)
+        busy_accounts.discard(account_name)
         try:
             if checker_page is not None and not checker_page.is_closed():
                 await checker_page.close()
@@ -1755,6 +1772,9 @@ async def process_task_queue():
         selected_account = None
         for acc in accounts:
             account_name, adspower_id = acc
+            if account_name in busy_accounts:
+                logging.info(f"[{account_name}] ⏩ Аккаунт занят, пропускаем.")
+                continue
             async with db.execute("SELECT COUNT(*) FROM task_history WHERE account_name = ? AND timestamp >= datetime('now', '-1 hour')", (account_name,)) as cursor:
                 count_hour = (await cursor.fetchone())[0]
             async with db.execute("SELECT COUNT(*) FROM task_history WHERE account_name = ? AND timestamp >= datetime('now', '-1 day')", (account_name,)) as cursor:
@@ -1906,6 +1926,7 @@ async def run_revisor(proj_name, message: Message):
         logging.error(f"Ошибка Ревизора (Playwright): {e}")
     finally:
         active_statuses.pop(f"Ревизор_{proj_name}", None)
+        busy_accounts.discard(account_name)
         try:
             if 'page' in locals() and not page.is_closed():
                 await page.close()
@@ -2156,6 +2177,10 @@ async def check_account_shadow_ban(account_name, adspower_id):
     а не через JS .click(). Дополнительно перехватывается сетевой ответ TikTok
     для подтверждения что лайк реально дошёл до сервера до проверки.
     """
+    if account_name in busy_accounts:
+        logging.warning(f"[{account_name}] ⚠️ Аккаунт занят, проверка теневого бана пропущена.")
+        return "BUSY"
+    busy_accounts.add(account_name)
     active_statuses[f"ShadowCheck_{account_name}"] = "Запуск проверки на теневой бан..."
     try:
         api_key = await get_api_key()
@@ -2354,6 +2379,7 @@ async def check_account_shadow_ban(account_name, adspower_id):
         return "ERROR"
     finally:
         active_statuses.pop(f"ShadowCheck_{account_name}", None)
+        busy_accounts.discard(account_name)
         try:
             api_key = await get_api_key()
             stop_url = f"http://127.0.0.1:{ADSPOWER_API_PORT}/api/v1/browser/stop?user_id={adspower_id}&api_key={api_key}"
