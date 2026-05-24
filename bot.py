@@ -1,7 +1,9 @@
 import asyncio
+import contextlib
 import logging
 import random
 import json
+import time
 from urllib.parse import quote
 import os
 import re
@@ -12,6 +14,8 @@ import requests
 import aiosqlite
 from datetime import datetime
 
+from dotenv import load_dotenv
+
 from aiogram import Bot, Dispatcher, types, Router, F, BaseMiddleware
 from aiogram.filters import Command, StateFilter
 from aiogram.types import Message, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
@@ -21,14 +25,38 @@ from aiogram.fsm.state import State, StatesGroup
 from playwright.async_api import async_playwright
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# ================= КОНФИГУРАЦИЯ =================
-BOT_TOKEN = "8740905900:AAGibTbfUk2ur0-Wu1etMyTL5Q1B0Uu910A"
-ADMIN_IDS = [8406205570, 7852546188]
-ADMIN_ID = ADMIN_IDS[0]
+# ================= КОНФИГУРАЦИЯ (из .env) =================
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_IDS = [
+    int(os.getenv("ADMIN_ID_1", "0")),
+    int(os.getenv("ADMIN_ID_2", "0")),
+]
+ADMIN_IDS = [aid for aid in ADMIN_IDS if aid != 0]
+ADMIN_ID = ADMIN_IDS[0] if ADMIN_IDS else 0
+
+ADSPOWER_API_PORT = os.getenv("ADSPOWER_API_PORT", "50325")
+DB_NAME = os.getenv("DB_NAME", "tiktok_bot.db")
+ASOCKS_CHANGE_IP_LINK = os.getenv("ASOCKS_CHANGE_IP_LINK", "")
+LIMIT_PER_HOUR = int(os.getenv("LIMIT_PER_HOUR", "10"))
+LIMIT_PER_DAY = int(os.getenv("LIMIT_PER_DAY", "30"))
 
 # ================= ГЛОБАЛЬНЫЕ СТАТУСЫ =================
 active_statuses = {}
-is_shadow_checking = False
+
+# Замена глобального флага на asyncio.Lock (потокобезопасно)
+shadow_check_lock = asyncio.Lock()
+
+# Кэш api_key с TTL 60 секунд (избегаем лишних запросов к БД)
+_api_key_cache: dict = {"value": None, "ts": 0.0}
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
+
 
 async def send_to_all_admins(text: str, parse_mode: str = "Markdown", reply_markup=None):
     for admin_id in ADMIN_IDS:
@@ -36,19 +64,6 @@ async def send_to_all_admins(text: str, parse_mode: str = "Markdown", reply_mark
             await bot.send_message(admin_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
         except Exception as e:
             logging.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
-
-ADSPOWER_API_PORT = "50325"
-DB_NAME = "tiktok_bot.db"
-ASOCKS_CHANGE_IP_LINK = "https://api.asocks.com/v2/proxy/refresh/5883102?apiKey=4141ZL8bl0rXptZCBHtCRw4p9zI4g3mP"
-
-LIMIT_PER_HOUR = 10
-LIMIT_PER_DAY = 30
-
-logging.basicConfig(level=logging.INFO)
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-router = Router()
-dp.include_router(router)
 
 
 
@@ -133,6 +148,7 @@ async def init_db():
                             value TEXT
                         )''')
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('ads_api_key', 'ed2a1b2b2fbcc9e818de71d5f286aeb0008c34ec73fa1418')")
+        # --- Миграции (выполняются один раз при старте, не в планировщике) ---
         try:
             await db.execute("ALTER TABLE accounts ADD COLUMN tiktok_nickname TEXT")
         except:
@@ -149,14 +165,28 @@ async def init_db():
             await db.execute("ALTER TABLE dialogues ADD COLUMN first_comment_id TEXT")
         except:
             pass
+
+        # --- Уникальный индекс для дедупликации задач (#9) ---
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_project_url "
+            "ON tasks(project_name, video_url)"
+        )
+
         await db.commit()
 
 
-async def get_api_key():
+async def get_api_key() -> str:
+    """Возвращает api_key из БД с кэшированием на 60 секунд (#8)."""
+    now = time.monotonic()
+    if _api_key_cache["value"] is not None and now - _api_key_cache["ts"] < 60:
+        return _api_key_cache["value"]
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute("SELECT value FROM settings WHERE key='ads_api_key'")
         row = await cursor.fetchone()
-        return row[0] if row else ""
+    value = row[0] if row else ""
+    _api_key_cache["value"] = value
+    _api_key_cache["ts"] = now
+    return value
 
 
 
@@ -224,12 +254,6 @@ def kb_delete_item(item_type, item_name, back_callback):
 
 
 # ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
-def parse_spintax(text: str) -> str:
-    pattern = re.compile(r'\{([^{}]*)\}')
-    while pattern.search(text):
-        text = pattern.sub(lambda m: random.choice(m.group(1).split('|')), text, count=1)
-    return text
-
 def spin_text(text: str) -> str:
     while True:
         match = re.search(r'\{([^{}]*)\}', text)
@@ -314,6 +338,37 @@ async def send_error_to_tg(error_msg: str, account_name: str = "SYSTEM"):
         await send_to_all_admins(text)
     except Exception as e:
         logging.error(f"Не удалось отправить лог в TG: {e}")
+
+
+# ================= КОНТЕКСТНЫЙ МЕНЕДЖЕР ADSPOWER (#6) =================
+@contextlib.asynccontextmanager
+async def adspower_profile(adspower_id: str, account_name: str):
+    """
+    Гарантирует закрытие AdsPower-профиля даже при исключениях.
+    Использование:
+        async with adspower_profile(adspower_id, account_name) as ws_endpoint:
+            ...
+    """
+    api_key = await get_api_key()
+    open_url = f"http://127.0.0.1:{ADSPOWER_API_PORT}/api/v1/browser/start?user_id={adspower_id}&api_key={api_key}"
+    try:
+        resp = requests.get(open_url, timeout=10).json()
+        if resp.get("code") != 0:
+            raise RuntimeError(f"AdsPower ошибка: {resp.get('msg')}")
+        ws_endpoint = resp["data"]["ws"]["puppeteer"]
+    except Exception as e:
+        raise RuntimeError(f"Не удалось запустить профиль {adspower_id}: {e}")
+
+    try:
+        yield ws_endpoint
+    finally:
+        try:
+            api_key_stop = await get_api_key()
+            stop_url = f"http://127.0.0.1:{ADSPOWER_API_PORT}/api/v1/browser/stop?user_id={adspower_id}&api_key={api_key_stop}"
+            requests.get(stop_url, timeout=10)
+            logging.info(f"[{account_name}] 🛑 Профиль AdsPower закрыт.")
+        except Exception as e:
+            logging.debug(f"[{account_name}] Ошибка закрытия профиля: {e}")
 
 
 
@@ -510,30 +565,17 @@ async def tiktot_worker(account_name, adspower_id, project_name, video_url, temp
     logging.info(f"[{account_name}] Попытка запуска профиля: {adspower_id}")
     active_statuses[account_name] = f"Запуск профиля AdsPower в проекте '{project_name}'..."
 
-    api_key = await get_api_key()
-    open_url = f"http://127.0.0.1:{ADSPOWER_API_PORT}/api/v1/browser/start?user_id={adspower_id}&api_key={api_key}"
-
     try:
-        resp = requests.get(open_url, timeout=10).json()
-        if resp.get("code") != 0:
-            await send_error_to_tg(f"AdsPower ошибка: {resp.get('msg')}", account_name)
-            active_statuses.pop(account_name, None)
-            return False
-        ws_endpoint = resp["data"]["ws"]["puppeteer"]
-    except Exception as e:
-        await send_error_to_tg(f"Ошибка API: {e}", account_name)
-        active_statuses.pop(account_name, None)
-        return False
+        async with adspower_profile(adspower_id, account_name) as ws_endpoint:
+            async with async_playwright() as p:
+                browser = await p.chromium.connect_over_cdp(ws_endpoint)
+                context = browser.contexts[0]
+                page = await context.new_page()
 
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.connect_over_cdp(ws_endpoint)
-            context = browser.contexts[0]
-            page = await context.new_page()
+                open_video_url = add_comment_id_to_url(video_url, reply_to_comment_id) if reply_to_comment_id else video_url
+                logging.info(f"[{account_name}] Переход к видео: {open_video_url}")
+                active_statuses[account_name] = f"Подключение к браузеру, открытие видео {open_video_url[:35]}..."
 
-            open_video_url = add_comment_id_to_url(video_url, reply_to_comment_id) if reply_to_comment_id else video_url
-            logging.info(f"[{account_name}] Переход к видео: {open_video_url}")
-            active_statuses[account_name] = f"Подключение к браузеру, открытие видео {open_video_url[:35]}..."
 
             goto_success = False
             for goto_attempt in range(1, 4):
@@ -1142,6 +1184,10 @@ async def tiktot_worker(account_name, adspower_id, project_name, video_url, temp
     except Exception as e:
         await send_error_to_tg(f"Ошибка на странице: {str(e)[:100]}", account_name)
         return False
+    except RuntimeError as e:
+        # Ошибка запуска AdsPower-профиля (из adspower_profile)
+        await send_error_to_tg(str(e), account_name)
+        return False
     finally:
         active_statuses.pop(account_name, None)
         try:
@@ -1151,19 +1197,132 @@ async def tiktot_worker(account_name, adspower_id, project_name, video_url, temp
                 await context.close()
             if 'browser' in locals():
                 await browser.close()
-            try:
-                api_key = await get_api_key()
-                stop_url = f"http://127.0.0.1:{ADSPOWER_API_PORT}/api/v1/browser/stop?user_id={adspower_id}&api_key={api_key}"
-                requests.get(stop_url, timeout=10)
-                logging.info(f"[{account_name}] 🛑 Профиль AdsPower успешно закрыт.")
-            except:
-                pass
         except Exception as e:
-            logging.debug(f"Ошибка закрытия профиля: {e}")
+            logging.debug(f"Ошибка закрытия браузера: {e}")
 
 
 
 # ================= АВТО-ПАРСЕР TIKTOK =================
+
+# --- Вспомогательная функция (#2): заменяет дублированный блок проверки видео ---
+async def check_and_filter_video(
+    page,
+    video_url: str,
+    account_name: str,
+    search_url: str,
+    current_ts: int,
+    max_age_seconds: int,
+    min_views: int,
+    kw_lower: str,
+    kw_words: list,
+    is_foryou: bool,
+    is_hashtag: bool,
+) -> str | None:
+    """
+    Открывает страницу видео, проверяет просмотры / дату / релевантность.
+    Возвращает чистый URL если видео прошло все фильтры, иначе None.
+    """
+    try:
+        await page.goto(video_url, wait_until="domcontentloaded", timeout=25000)
+        await page.wait_for_timeout(2500)
+
+        video_data = await page.evaluate(r'''() => {
+            let views = 0, createTime = 0, fullText = "";
+            try {
+                const scripts = document.querySelectorAll(
+                    'script[id="__UNIVERSAL_DATA_FOR_REHYDRATION__"], script[id="SIGI_STATE"]'
+                );
+                for (let sc of scripts) {
+                    const t = sc.textContent || "";
+                    const mv = t.match(/"playCount"\s*:\s*(\d+)/);
+                    if (mv) views = parseInt(mv[1]);
+                    const mc = t.match(/"createTime"\s*:\s*"?(\d+)"?/);
+                    if (mc) createTime = parseInt(mc[1]);
+                    const md = t.match(/"desc"\s*:\s*"([^"]{0,800})"/);
+                    if (md) fullText += " " + md[1];
+                    const tagMatches = [...t.matchAll(/"hashtagName"\s*:\s*"([^"]+)"/g)];
+                    for (const m of tagMatches) fullText += " " + m[1];
+                    if (views > 0) break;
+                }
+                const descSelectors = [
+                    '[data-e2e="browse-video-desc"]', '[data-e2e="video-desc"]',
+                    '[class*="SpanDesc"]', '[class*="video-meta-title"]', 'h1[class*="title"]',
+                ];
+                for (const sel of descSelectors) {
+                    const el = document.querySelector(sel);
+                    if (el) { fullText += " " + (el.innerText || el.textContent || ""); break; }
+                }
+                document.querySelectorAll('a[href*="/tag/"], a[data-e2e*="hashtag"]').forEach(a => {
+                    fullText += " " + (a.innerText || a.textContent || "");
+                });
+                if (views === 0) {
+                    const viewSelectors = [
+                        '[data-e2e="like-icon"] + strong', '[data-e2e="video-views"]',
+                        '[class*="StrongVideoPlayCount"]',
+                    ];
+                    for (const sel of viewSelectors) {
+                        const el = document.querySelector(sel);
+                        if (el) {
+                            const txt = (el.innerText || "").replace(/[,. ]/g, "").toUpperCase();
+                            if (txt.includes("M")) views = parseFloat(txt) * 1000000;
+                            else if (txt.includes("K")) views = parseFloat(txt) * 1000;
+                            else views = parseInt(txt) || 0;
+                            break;
+                        }
+                    }
+                }
+            } catch(e) {}
+            return { views, createTime, fullText: fullText.toLowerCase() };
+        }''')
+
+        views_count = video_data.get("views", 0)
+        create_time = video_data.get("createTime", 0)
+        full_text = video_data.get("fullText", "")
+
+        logging.info(f"[{account_name}] 📊 Видео: {views_count} просм. | текст: '{full_text[:80]}'")
+
+        if max_age_seconds > 0 and create_time > 0:
+            if (current_ts - create_time) > max_age_seconds:
+                logging.info(f"[{account_name}] ⏩ Слишком старое видео, пропускаю")
+                await page.go_back(wait_until="domcontentloaded", timeout=15000)
+                await page.wait_for_timeout(1000)
+                return None
+
+        if views_count < min_views:
+            logging.info(f"[{account_name}] ⏩ Мало просмотров: {views_count} < {min_views}")
+            await page.go_back(wait_until="domcontentloaded", timeout=15000)
+            await page.wait_for_timeout(1000)
+            return None
+
+        is_relevant = True
+        if kw_lower and not is_foryou:
+            if is_hashtag:
+                is_relevant = kw_lower in full_text
+            else:
+                is_relevant = any(w in full_text for w in kw_words) if kw_words else kw_lower in full_text
+
+        if not is_relevant:
+            logging.info(f"[{account_name}] ⏩ Не по теме '{kw_lower}': {video_url}")
+            await page.go_back(wait_until="domcontentloaded", timeout=15000)
+            await page.wait_for_timeout(1000)
+            return None
+
+        clean_video_url = video_url.split('?')[0].split('#')[0]
+        await page.go_back(wait_until="domcontentloaded", timeout=15000)
+        await page.wait_for_timeout(1200)
+        return clean_video_url
+
+    except Exception as e_check:
+        logging.warning(f"[{account_name}] ⚠️ Ошибка проверки {video_url}: {e_check}")
+        try:
+            if search_url not in page.url:
+                await page.goto(search_url, wait_until="domcontentloaded", timeout=25000)
+                await page.wait_for_timeout(2000)
+        except:
+            pass
+        return None
+
+
 async def tiktok_parser(account_name, adspower_id, project_name, keyword, target_count, min_views, age_filter, message: Message, export_only: bool = False):
     logging.info(f"[{account_name}] Парсинг: {keyword} | Мин. просмотров: {min_views}")
     active_statuses[f"Парсер_{account_name}"] = f"Запуск парсера для ключевого слова '{keyword}'..."
@@ -1175,36 +1334,25 @@ async def tiktok_parser(account_name, adspower_id, project_name, keyword, target
         max_age_days = 0
     max_age_seconds = max_age_days * 86400 if max_age_days > 0 else 0
 
-    api_key = await get_api_key()
-    open_url = f"http://127.0.0.1:{ADSPOWER_API_PORT}/api/v1/browser/start?user_id={adspower_id}&api_key={api_key}"
-    try:
-        resp = requests.get(open_url, timeout=10).json()
-        if resp.get("code") != 0:
-            await message.answer(f"❌ Ошибка запуска профиля: {resp.get('msg')}")
-            return
-        ws_endpoint = resp["data"]["ws"]["puppeteer"]
-    except Exception as e:
-        await message.answer(f"❌ Ошибка запуска профиля: {e}")
-        return
-
-    collected_urls = set()
-    processed_raw_links = set()
+    collected_urls: set = set()
+    processed_raw_links: set = set()
     is_foryou = (keyword == "FORYOU")
     is_hashtag = keyword.startswith("#") and not is_foryou
 
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.connect_over_cdp(ws_endpoint)
-            context = browser.contexts[0]
+        async with adspower_profile(adspower_id, account_name) as ws_endpoint:
+            async with async_playwright() as p:
+                browser = await p.chromium.connect_over_cdp(ws_endpoint)
+                context = browser.contexts[0]
 
-            reset_page = await context.new_page()
-            await reset_page.goto("about:blank", wait_until="domcontentloaded")
-            await reset_page.wait_for_timeout(500)
-            await reset_page.close()
+                reset_page = await context.new_page()
+                await reset_page.goto("about:blank", wait_until="domcontentloaded")
+                await reset_page.wait_for_timeout(500)
+                await reset_page.close()
 
-            page = await context.new_page()
+                page = await context.new_page()
 
-            intercepted_data = {}
+                intercepted_data = {}
 
             async def intercept_api(response):
                 try:
@@ -1400,243 +1548,42 @@ async def tiktok_parser(account_name, adspower_id, project_name, keyword, target
                 if new_raw_links:
                     logging.info(f"[{account_name}] 🔎 Найдено в DOM видео: {len(new_raw_links)}")
 
-                    if export_only:
-                        kw_lower = keyword.lower().replace("#", "").strip() if not is_foryou else ""
-                        kw_words = [w for w in kw_lower.split() if len(w) > 2] if kw_lower else []
+                    # Используем единую функцию check_and_filter_video (#2)
+                    kw_lower = keyword.lower().replace("#", "").strip() if not is_foryou else ""
+                    kw_words = [w for w in kw_lower.split() if len(w) > 2] if kw_lower else []
 
-                        for video_url, card_text in new_raw_links:
-                            if len(collected_urls) >= target_count:
-                                break
+                    for video_url, card_text in new_raw_links:
+                        if len(collected_urls) >= target_count:
+                            break
 
-                            active_statuses[f"Парсер_{account_name}"] = f"Проверяю видео {len(collected_urls)+1}/{target_count}..."
-                            logging.info(f"[{account_name}] 🖱️ Кликаю на видео: {video_url}")
+                        active_statuses[f"Парсер_{account_name}"] = f"Проверяю видео {len(collected_urls)+1}/{target_count}..."
+                        logging.info(f"[{account_name}] 🖱️ Кликаю на видео: {video_url}")
 
-                            try:
-                                await page.goto(video_url, wait_until="domcontentloaded", timeout=25000)
-                                await page.wait_for_timeout(2500)
+                        result_url = await check_and_filter_video(
+                            page=page,
+                            video_url=video_url,
+                            account_name=account_name,
+                            search_url=search_url,
+                            current_ts=current_ts,
+                            max_age_seconds=max_age_seconds,
+                            min_views=min_views,
+                            kw_lower=kw_lower,
+                            kw_words=kw_words,
+                            is_foryou=is_foryou,
+                            is_hashtag=is_hashtag,
+                        )
+                        if result_url:
+                            collected_urls.add(result_url)
+                            logging.info(f"[{account_name}] ✅ ДОБАВЛЕНО [{len(collected_urls)}/{target_count}]: {result_url}")
+                            active_statuses[f"Парсер_{account_name}"] = f"✅ Собрано {len(collected_urls)}/{target_count} — '{keyword}'"
 
-                                video_data = await page.evaluate(r'''() => {
-                                    let views = 0, createTime = 0, fullText = "";
-                                    try {
-                                        const scripts = document.querySelectorAll(
-                                            'script[id="__UNIVERSAL_DATA_FOR_REHYDRATION__"], script[id="SIGI_STATE"]'
-                                        );
-                                        for (let sc of scripts) {
-                                            const t = sc.textContent || "";
-                                            const mv = t.match(/"playCount"\s*:\s*(\d+)/);
-                                            if (mv) views = parseInt(mv[1]);
-                                            const mc = t.match(/"createTime"\s*:\s*"?(\d+)"?/);
-                                            if (mc) createTime = parseInt(mc[1]);
-                                            const md = t.match(/"desc"\s*:\s*"([^"]{0,800})"/);
-                                            if (md) fullText += " " + md[1];
-                                            const tagMatches = [...t.matchAll(/"hashtagName"\s*:\s*"([^"]+)"/g)];
-                                            for (const m of tagMatches) fullText += " " + m[1];
-                                            if (views > 0) break;
-                                        }
-                                        const descSelectors = [
-                                            '[data-e2e="browse-video-desc"]',
-                                            '[data-e2e="video-desc"]',
-                                            '[class*="SpanDesc"]',
-                                            '[class*="video-meta-title"]',
-                                            'h1[class*="title"]',
-                                        ];
-                                        for (const sel of descSelectors) {
-                                            const el = document.querySelector(sel);
-                                            if (el) { fullText += " " + (el.innerText || el.textContent || ""); break; }
-                                        }
-                                        document.querySelectorAll('a[href*="/tag/"], a[data-e2e*="hashtag"]').forEach(a => {
-                                            fullText += " " + (a.innerText || a.textContent || "");
-                                        });
-                                        if (views === 0) {
-                                            const viewSelectors = [
-                                                '[data-e2e="like-icon"] + strong',
-                                                '[data-e2e="video-views"]',
-                                                '[class*="StrongVideoPlayCount"]',
-                                            ];
-                                            for (const sel of viewSelectors) {
-                                                const el = document.querySelector(sel);
-                                                if (el) {
-                                                    const txt = (el.innerText || "").replace(/[,. ]/g, "").toUpperCase();
-                                                    if (txt.includes("M")) views = parseFloat(txt) * 1000000;
-                                                    else if (txt.includes("K")) views = parseFloat(txt) * 1000;
-                                                    else views = parseInt(txt) || 0;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    } catch(e) {}
-                                    return { views, createTime, fullText: fullText.toLowerCase() };
-                                }''')
-
-                                views_count = video_data.get("views", 0)
-                                create_time = video_data.get("createTime", 0)
-                                full_text = video_data.get("fullText", "")
-
-                                logging.info(f"[{account_name}] 📊 Видео: {views_count} просм. | текст: '{full_text[:80]}'")
-
-                                if max_age_seconds > 0 and create_time > 0:
-                                    if (current_ts - create_time) > max_age_seconds:
-                                        logging.info(f"[{account_name}] ⏩ Слишком старое видео, пропускаю")
-                                        await page.go_back(wait_until="domcontentloaded", timeout=15000)
-                                        await page.wait_for_timeout(1000)
-                                        continue
-
-                                if views_count < min_views:
-                                    logging.info(f"[{account_name}] ⏩ Мало просмотров: {views_count} < {min_views}")
-                                    await page.go_back(wait_until="domcontentloaded", timeout=15000)
-                                    await page.wait_for_timeout(1000)
-                                    continue
-
-                                is_relevant = True
-                                if kw_lower and not is_foryou:
-                                    if is_hashtag:
-                                        is_relevant = kw_lower in full_text
-                                    else:
-                                        if kw_words:
-                                            is_relevant = any(w in full_text for w in kw_words)
-                                        else:
-                                            is_relevant = kw_lower in full_text
-
-                                if not is_relevant:
-                                    logging.info(f"[{account_name}] ⏩ Не по теме '{kw_lower}': {video_url}")
-                                    await page.go_back(wait_until="domcontentloaded", timeout=15000)
-                                    await page.wait_for_timeout(1000)
-                                    continue
-
-                                clean_video_url = video_url.split('?')[0].split('#')[0]
-                                collected_urls.add(clean_video_url)
-                                logging.info(f"[{account_name}] ✅ ДОБАВЛЕНО ({views_count} просм.) [{len(collected_urls)}/{target_count}]: {clean_video_url}")
-                                active_statuses[f"Парсер_{account_name}"] = f"✅ Собрано {len(collected_urls)}/{target_count} — '{keyword}'"
-
-                                await page.go_back(wait_until="domcontentloaded", timeout=15000)
-                                await page.wait_for_timeout(1200)
-
-                            except Exception as e_check:
-                                logging.warning(f"[{account_name}] ⚠️ Ошибка проверки {video_url}: {e_check}")
+                            # Промежуточный прогресс (#7): каждые 25 URL сообщаем пользователю
+                            if len(collected_urls) % 25 == 0:
                                 try:
-                                    if search_url not in page.url:
-                                        await page.goto(search_url, wait_until="domcontentloaded", timeout=25000)
-                                        await page.wait_for_timeout(2000)
-                                except:
-                                    pass
-                    else:
-                        # "В работу" — тот же алгоритм глубокой проверки что и в .txt
-                        kw_lower = keyword.lower().replace("#", "").strip() if not is_foryou else ""
-                        kw_words = [w for w in kw_lower.split() if len(w) > 2] if kw_lower else []
-
-                        for video_url, card_text in new_raw_links:
-                            if len(collected_urls) >= target_count:
-                                break
-
-                            active_statuses[f"Парсер_{account_name}"] = f"Проверяю видео {len(collected_urls)+1}/{target_count}..."
-                            logging.info(f"[{account_name}] 🖱️ Кликаю на видео: {video_url}")
-
-                            try:
-                                await page.goto(video_url, wait_until="domcontentloaded", timeout=25000)
-                                await page.wait_for_timeout(2500)
-
-                                video_data = await page.evaluate(r'''() => {
-                                    let views = 0, createTime = 0, fullText = "";
-                                    try {
-                                        const scripts = document.querySelectorAll(
-                                            'script[id="__UNIVERSAL_DATA_FOR_REHYDRATION__"], script[id="SIGI_STATE"]'
-                                        );
-                                        for (let sc of scripts) {
-                                            const t = sc.textContent || "";
-                                            const mv = t.match(/"playCount"\s*:\s*(\d+)/);
-                                            if (mv) views = parseInt(mv[1]);
-                                            const mc = t.match(/"createTime"\s*:\s*"?(\d+)"?/);
-                                            if (mc) createTime = parseInt(mc[1]);
-                                            const md = t.match(/"desc"\s*:\s*"([^"]{0,800})"/);
-                                            if (md) fullText += " " + md[1];
-                                            const tagMatches = [...t.matchAll(/"hashtagName"\s*:\s*"([^"]+)"/g)];
-                                            for (const m of tagMatches) fullText += " " + m[1];
-                                            if (views > 0) break;
-                                        }
-                                        const descSelectors = [
-                                            '[data-e2e="browse-video-desc"]',
-                                            '[data-e2e="video-desc"]',
-                                            '[class*="SpanDesc"]',
-                                            '[class*="video-meta-title"]',
-                                            'h1[class*="title"]',
-                                        ];
-                                        for (const sel of descSelectors) {
-                                            const el = document.querySelector(sel);
-                                            if (el) { fullText += " " + (el.innerText || el.textContent || ""); break; }
-                                        }
-                                        document.querySelectorAll('a[href*="/tag/"], a[data-e2e*="hashtag"]').forEach(a => {
-                                            fullText += " " + (a.innerText || a.textContent || "");
-                                        });
-                                        if (views === 0) {
-                                            const viewSelectors = [
-                                                '[data-e2e="like-icon"] + strong',
-                                                '[data-e2e="video-views"]',
-                                                '[class*="StrongVideoPlayCount"]',
-                                            ];
-                                            for (const sel of viewSelectors) {
-                                                const el = document.querySelector(sel);
-                                                if (el) {
-                                                    const txt = (el.innerText || "").replace(/[,. ]/g, "").toUpperCase();
-                                                    if (txt.includes("M")) views = parseFloat(txt) * 1000000;
-                                                    else if (txt.includes("K")) views = parseFloat(txt) * 1000;
-                                                    else views = parseInt(txt) || 0;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    } catch(e) {}
-                                    return { views, createTime, fullText: fullText.toLowerCase() };
-                                }''')
-
-                                views_count = video_data.get("views", 0)
-                                create_time = video_data.get("createTime", 0)
-                                full_text = video_data.get("fullText", "")
-
-                                logging.info(f"[{account_name}] 📊 Видео: {views_count} просм. | текст: '{full_text[:80]}'")
-
-                                if max_age_seconds > 0 and create_time > 0:
-                                    if (current_ts - create_time) > max_age_seconds:
-                                        logging.info(f"[{account_name}] ⏩ Слишком старое видео, пропускаю")
-                                        await page.go_back(wait_until="domcontentloaded", timeout=15000)
-                                        await page.wait_for_timeout(1000)
-                                        continue
-
-                                if views_count < min_views:
-                                    logging.info(f"[{account_name}] ⏩ Мало просмотров: {views_count} < {min_views}")
-                                    await page.go_back(wait_until="domcontentloaded", timeout=15000)
-                                    await page.wait_for_timeout(1000)
-                                    continue
-
-                                is_relevant = True
-                                if kw_lower and not is_foryou:
-                                    if is_hashtag:
-                                        is_relevant = kw_lower in full_text
-                                    else:
-                                        if kw_words:
-                                            is_relevant = any(w in full_text for w in kw_words)
-                                        else:
-                                            is_relevant = kw_lower in full_text
-
-                                if not is_relevant:
-                                    logging.info(f"[{account_name}] ⏩ Не по теме '{kw_lower}': {video_url}")
-                                    await page.go_back(wait_until="domcontentloaded", timeout=15000)
-                                    await page.wait_for_timeout(1000)
-                                    continue
-
-                                clean_video_url = video_url.split('?')[0].split('#')[0]
-                                collected_urls.add(clean_video_url)
-                                logging.info(f"[{account_name}] ✅ ДОБАВЛЕНО ({views_count} просм.) [{len(collected_urls)}/{target_count}]: {clean_video_url}")
-                                active_statuses[f"Парсер_{account_name}"] = f"✅ Собрано {len(collected_urls)}/{target_count} — '{keyword}'"
-
-                                await page.go_back(wait_until="domcontentloaded", timeout=15000)
-                                await page.wait_for_timeout(1200)
-
-                            except Exception as e_check:
-                                logging.warning(f"[{account_name}] ⚠️ Ошибка проверки {video_url}: {e_check}")
-                                try:
-                                    if search_url not in page.url:
-                                        await page.goto(search_url, wait_until="domcontentloaded", timeout=25000)
-                                        await page.wait_for_timeout(2000)
+                                    await message.answer(
+                                        f"⏳ Прогресс парсинга: `{len(collected_urls)}/{target_count}` видео собрано...",
+                                        parse_mode="Markdown"
+                                    )
                                 except:
                                     pass
 
@@ -1708,6 +1655,8 @@ async def tiktok_parser(account_name, adspower_id, project_name, keyword, target
 
     except Exception as e:
         logging.error(f"Ошибка парсера: {e}")
+    except RuntimeError as e:
+        await message.answer(f"❌ Ошибка запуска профиля AdsPower: {e}")
     finally:
         active_statuses.pop(f"Парсер_{account_name}", None)
         try:
@@ -1717,13 +1666,6 @@ async def tiktok_parser(account_name, adspower_id, project_name, keyword, target
                 await context.close()
             if 'browser' in locals():
                 await browser.close()
-            try:
-                api_key = await get_api_key()
-                stop_url = f"http://127.0.0.1:{ADSPOWER_API_PORT}/api/v1/browser/stop?user_id={adspower_id}&api_key={api_key}"
-                requests.get(stop_url, timeout=10)
-                logging.info(f"[{account_name}] 🛑 Профиль AdsPower успешно закрыт.")
-            except:
-                pass
         except:
             pass
 
@@ -1745,7 +1687,11 @@ async def tiktok_parser(account_name, adspower_id, project_name, keyword, target
             added = 0
             async with aiosqlite.connect(DB_NAME) as db:
                 for url in collected_urls:
-                    await db.execute("INSERT INTO tasks (project_name, video_url, template_text) VALUES (?, ?, ?)", (project_name, url, "{Круто|Интересно|Супер|Согласен}"))
+                    # INSERT OR IGNORE — дедупликация через уникальный индекс (#9)
+                    await db.execute(
+                        "INSERT OR IGNORE INTO tasks (project_name, video_url, template_text) VALUES (?, ?, ?)",
+                        (project_name, url, "{Круто|Интересно|Супер|Согласен}")
+                    )
                     added += 1
                 await db.commit()
             await message.answer(f"🎯 **Глубокий парсинг завершен!**\nПроект: `{project_name}`\nЗапрос: `{keyword}`\nМин. просмотров: `{min_views}`\nДобавлено в задачи: `{added}` шт.")
@@ -1756,17 +1702,6 @@ async def tiktok_parser(account_name, adspower_id, project_name, keyword, target
 
 # ================= ПЛАНИРОВЩИК =================
 async def process_task_queue():
-    async with aiosqlite.connect(DB_NAME) as db:
-        try:
-            await db.execute("ALTER TABLE dialogues ADD COLUMN first_account TEXT")
-        except:
-            pass
-        try:
-            await db.execute("ALTER TABLE dialogues ADD COLUMN first_comment_id TEXT")
-        except:
-            pass
-        await db.commit()
-
     async with aiosqlite.connect(DB_NAME) as db:
         query_reply = '''
             SELECT id, project_name, video_url, comment_text, reply_text, first_account, first_comment_id
@@ -2506,20 +2441,18 @@ async def _apply_shadow_ban_result(res, name, ads_id, tiktok_nick):
 
 async def check_all_accounts_shadow_ban():
     """Плановая проверка всех активных аккаунтов на теневой бан (каждые 15 минут)."""
-    global is_shadow_checking
-
     if active_statuses:
         busy_tasks = [k for k in active_statuses.keys() if not k.startswith("ShadowCheck_")]
         if busy_tasks:
             logging.info(f"⏸ Плановая проверка теневого бана отложена — идут активные задачи: {busy_tasks}")
             return
 
-    if is_shadow_checking:
+    if shadow_check_lock.locked():
         logging.info("Проверка на теневой бан уже выполняется.")
         return
-    is_shadow_checking = True
-    logging.info("🕵️ Начинаем плановую проверку аккаунтов на теневой бан (лайк-тест)...")
-    try:
+
+    async with shadow_check_lock:
+        logging.info("🕵️ Начинаем плановую проверку аккаунтов на теневой бан (лайк-тест)...")
         async with aiosqlite.connect(DB_NAME) as db:
             cursor = await db.execute("SELECT name, session_file, tiktok_nickname FROM accounts WHERE status = 'active'")
             accounts = await cursor.fetchall()
@@ -2533,29 +2466,25 @@ async def check_all_accounts_shadow_ban():
             active_statuses.pop(f"ShadowCheck_{name}", None)
             await _apply_shadow_ban_result(res, name, ads_id, tiktok_nick)
 
-    finally:
-        is_shadow_checking = False
-
 
 async def check_all_accounts_shadow_ban_manual(message: Message):
     """Ручная проверка всех активных аккаунтов на теневой бан по нажатию кнопки."""
-    global is_shadow_checking
-    if is_shadow_checking:
+    if shadow_check_lock.locked():
         await message.answer("🕵️‍♂️ **Проверка на теневой бан уже запущена!** Пожалуйста, подождите её окончания.")
         return
-    is_shadow_checking = True
-    msg = await message.answer(
-        "🕵️‍♂️ **Начинаю проверку активных аккаунтов на теневой бан...**\n\n"
-        "📋 **Метод:** лайк-тест с реальным кликом мыши\n"
-        "1️⃣ Заходим на живое видео из /foryou\n"
-        "2️⃣ Реальный клик мыши по кнопке лайка\n"
-        "3️⃣ Ждём подтверждения от сервера TikTok\n"
-        "4️⃣ Ждём 15 секунд\n"
-        "5️⃣ Перезагружаем страницу\n"
-        "6️⃣ Проверяем — стоит ли лайк\n\n"
-        "⏳ _Это может занять несколько минут..._"
-    )
-    try:
+
+    async with shadow_check_lock:
+        msg = await message.answer(
+            "🕵️‍♂️ **Начинаю проверку активных аккаунтов на теневой бан...**\n\n"
+            "📋 **Метод:** лайк-тест с реальным кликом мыши\n"
+            "1️⃣ Заходим на живое видео из /foryou\n"
+            "2️⃣ Реальный клик мыши по кнопке лайка\n"
+            "3️⃣ Ждём подтверждения от сервера TikTok\n"
+            "4️⃣ Ждём 15 секунд\n"
+            "5️⃣ Перезагружаем страницу\n"
+            "6️⃣ Проверяем — стоит ли лайк\n\n"
+            "⏳ _Это может занять несколько минут..._"
+        )
         async with aiosqlite.connect(DB_NAME) as db:
             cursor = await db.execute("SELECT name, session_file, tiktok_nickname FROM accounts WHERE status = 'active'")
             accounts = await cursor.fetchall()
@@ -2606,8 +2535,6 @@ async def check_all_accounts_shadow_ban_manual(message: Message):
             f"• 🔧 Сломанные AdsPower-профили: `{broken}`\n"
             f"• ❓ Ошибки проверки: `{errors}`"
         )
-    finally:
-        is_shadow_checking = False
 
 
 
@@ -2908,7 +2835,13 @@ async def process_search(message: Message, state: FSMContext):
             await message.answer(f"❌ В проекте `{proj_name}` нет активных аккаунтов.")
             return
         account_name, adspower_id = acc
-        await message.answer(f"🔍 **Запускаю умный поиск!**\nСлово: `{keyword}`\nФильтр просмотров: от `{min_views}`\nЦель: `{target_count}` шт.\n\n⏳ *Ищем...*", parse_mode="Markdown")
+        await message.answer(
+            f"🔍 **Запускаю умный поиск (В работу)!**\n"
+            f"Слово: `{keyword}`\nФильтр просмотров: от `{min_views}`\nЦель: `{target_count}` шт.\n"
+            f"📌 _Режим: ссылки добавятся в очередь задач проекта `{proj_name}`_\n\n"
+            f"⏳ *Ищем...*",
+            parse_mode="Markdown"
+        )
         asyncio.create_task(tiktok_parser(account_name, adspower_id, proj_name, keyword, target_count, min_views, age_filter, message, export_only=False))
     except Exception:
         await message.answer("❌ Формат ошибки. Пример: `alpha 10 10000 0 трейдинг`")
@@ -2940,7 +2873,13 @@ async def process_grab(message: Message, state: FSMContext):
             await message.answer(f"❌ В проекте `{proj_name}` нет активных аккаунтов.")
             return
         account_name, adspower_id = acc
-        await message.answer(f"🧲 **Начинаю сбор базы!**\nСлово: `{keyword}`\nЦель: `{target_count}` шт.\n\n⏳ *Ищем...*", parse_mode="Markdown")
+        await message.answer(
+            f"🧲 **Начинаю сбор базы (.txt)!**\n"
+            f"Слово: `{keyword}`\nЦель: `{target_count}` шт.\n"
+            f"📌 _Режим: получите файл со ссылками в конце_\n\n"
+            f"⏳ *Ищем...*",
+            parse_mode="Markdown"
+        )
         asyncio.create_task(tiktok_parser(account_name, adspower_id, proj_name, keyword, target_count, min_views, age_filter, message, export_only=True))
     except Exception:
         await message.answer("❌ Формат ошибки. Пример: `alpha 100 10000 0 трейдинг`")
